@@ -51,11 +51,11 @@ dnl - interfaces added/removed/changed -> increment CURRENT, REVISION = 0
 dnl - interfaces added -> increment AGE
 dnl - interfaces removed -> AGE = 0
 dnl sets GST_LT_LDFLAGS
-AS_LIBTOOL(GST, 1401, 0, 1401)
+AS_LIBTOOL(GST, 1400, 0, 1400)
 
 dnl *** required versions of GStreamer stuff ***
-GST_REQ=1.14.1
-GSTPB_REQ=1.14.1
+GST_REQ=1.14.0
+GSTPB_REQ=1.14.0
 
 dnl *** autotools stuff ****
 
