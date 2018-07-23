@@ -319,7 +319,6 @@ GST_DEBUG_CATEGORY (gst_dash_demux_debug);
 enum
 {
   PROP_0,
-
   PROP_MAX_BUFFERING_TIME,
   PROP_BANDWIDTH_USAGE,
   PROP_MAX_BITRATE,
@@ -327,6 +326,8 @@ enum
   PROP_MAX_VIDEO_HEIGHT,
   PROP_MAX_VIDEO_FRAMERATE,
   PROP_PRESENTATION_DELAY,
+  PROP_NTP_SECONDS,
+  PROP_NTP_SECONDS_FRACTION,
   PROP_LAST
 };
 
@@ -339,6 +340,8 @@ enum
 #define DEFAULT_MAX_VIDEO_FRAMERATE_N     0
 #define DEFAULT_MAX_VIDEO_FRAMERATE_D     1
 #define DEFAULT_PRESENTATION_DELAY     "10s"    /* 10s */
+#define DEFAULT_NTP_SECONDS				  0
+#define DEFAULT_NTP_SECONDS_FRACTION      0
 
 /* Clock drift compensation for live streams */
 #define SLOW_CLOCK_UPDATE_INTERVAL  (1000000 * 30 * 60) /* 30 minutes */
@@ -594,6 +597,19 @@ gst_dash_demux_class_init (GstDashDemuxClass * klass)
           "Default presentation delay (in seconds, milliseconds or fragments) (e.g. 12s, 2500ms, 3f)",
           DEFAULT_PRESENTATION_DELAY,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  
+  /*DAGOMI*/  
+  g_object_class_install_property (gobject_class, PROP_NTP_SECONDS,
+      g_param_spec_uint ("get-ntp-seconds", "Get Ntp Seconds",
+          "Get fragment time stamp in seconds.",
+          0,G_MAXUINT,DEFAULT_NTP_SECONDS,
+          G_PARAM_READABLE| G_PARAM_STATIC_STRINGS));
+          
+  g_object_class_install_property (gobject_class, PROP_NTP_SECONDS_FRACTION,
+      g_param_spec_uint ("get-ntp-seconds-fraction", "Get Ntp Fraction of sections",
+          "Get fragment time stamp in fraction of seconds.",
+          0,G_MAXUINT,DEFAULT_NTP_SECONDS_FRACTION,
+          G_PARAM_READABLE| G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (gstelement_class,
       &gst_dash_demux_audiosrc_template);
@@ -664,7 +680,8 @@ gst_dash_demux_init (GstDashDemux * demux)
   demux->max_video_framerate_n = DEFAULT_MAX_VIDEO_FRAMERATE_N;
   demux->max_video_framerate_d = DEFAULT_MAX_VIDEO_FRAMERATE_D;
   demux->default_presentation_delay = g_strdup (DEFAULT_PRESENTATION_DELAY);
-
+  demux->NTP_SEC = DEFAULT_NTP_SECONDS;
+  demux->NTP_FRAC = DEFAULT_NTP_SECONDS_FRACTION;
   g_mutex_init (&demux->client_lock);
 
   gst_adaptive_demux_set_stream_struct_size (GST_ADAPTIVE_DEMUX_CAST (demux),
@@ -740,6 +757,12 @@ gst_dash_demux_get_property (GObject * object, guint prop_id, GValue * value,
         g_value_set_static_string (value, "");
       else
         g_value_set_string (value, demux->default_presentation_delay);
+      break;
+      case PROP_NTP_SECONDS:
+        g_value_set_uint (value, demux->NTP_SEC);
+      break;
+      case PROP_NTP_SECONDS_FRACTION:
+        g_value_set_uint (value, demux->NTP_FRAC);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -2396,7 +2419,7 @@ gst_dash_demux_update_manifest_data (GstAdaptiveDemux * demux,
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
   GstMpdClient *new_client = NULL;
   GstMapInfo mapinfo;
-
+  
   GST_DEBUG_OBJECT (demux, "Updating manifest file from URL");
 
   /* parse the manifest file */
@@ -2488,12 +2511,6 @@ gst_dash_demux_update_manifest_data (GstAdaptiveDemux * demux,
          * 10 microseconds to get back to the correct segment. The errors are
          * usually on the order of nanoseconds so it should be enough.
          */
-
-        /* _get_next_fragment_timestamp() returned relative timestamp to
-         * corresponding period start, but _client_stream_seek expects absolute
-         * MPD time. */
-        ts += gst_mpd_parser_get_period_start_time (dashdemux->client);
-
         GST_DEBUG_OBJECT (GST_ADAPTIVE_DEMUX_STREAM_PAD (demux_stream),
             "Current position: %" GST_TIME_FORMAT ", updating to %"
             GST_TIME_FORMAT, GST_TIME_ARGS (ts),
@@ -2806,8 +2823,46 @@ gst_dash_demux_parse_isobmff (GstAdaptiveDemux * demux,
   guint32 fourcc;
   guint header_size;
   guint64 size, buffer_offset;
+  guint32 CMAF_preamb,CMAF_styp,CMAF_ISMF,CMAF_preamb_1,CMAF_preamb_2,
+  CMAF_imsf,CMAF_sidx,CMAF_unknow_1,CMAF_prft,CMAF_unknow_2,CMAF_unknow_3,
+  CMAF_NTP_SEC,CMAF_NTP_FRAC,position;
 
   *sidx_seek_needed = FALSE;
+  
+  
+/*
+	+-------------------------------------------------------+
+	|          |8|          |16|           |24|          |32|
+	+-------------------------------------------------------+ 
+	|            |    STYP     |   IMSF       |             |
+	+------------------------------ ------------------------+
+	|            |             |              |             | 
+	+-------------------------------------------------------+
+	|     IMSF   |    SIDX     |     ??       |   PRFT      |
+	+-------------------------------------------------------+
+	|            |             |              |             |
+	+-------------------------------------------------------+
+	|     ??     |     ??      | NTP(SECONDS) |NTP(FRACTION)|
+	+-------------------------------------------------------+
+	|            |             |              |             |								
+	+-------------------------------------------------------+								
+*/
+
+/*
+   The timing information is contained in the message body of the HTTP
+   response and contains a time value formatted according to NTP timestamp
+   format in IETF RFC 5905.
+
+       0                   1                   2                   3
+       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                            Seconds                            |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                            Fraction                           |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+                             NTP Timestamp Format
+*/
 
   /* This must not be called when we're in the mdat. We only look at the mdat
    * header and then stop parsing the boxes as we're only interested in the
@@ -2827,7 +2882,52 @@ gst_dash_demux_parse_isobmff (GstAdaptiveDemux * demux,
   /* At the start of a box => Parse it */
   gst_buffer_map (buffer, &map, GST_MAP_READ);
   gst_byte_reader_init (&reader, map.data, map.size);
+  /* Read ISOBMFF Header for extract PRFT*/
+  
+  //gst_byte_reader_get_uint32_be (&reader,&CMAF_preamb);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_styp);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_ISMF);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_preamb_1);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_preamb_2);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_imsf);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_sidx);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_unknow_1);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_prft);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_unknow_2);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_unknow_3);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_NTP_SEC);
+  gst_byte_reader_get_uint32_be (&reader,&CMAF_NTP_FRAC);
+  
 
+  /* DEBUG
+  g_print(" CMAF_preamb % " G_GUINT32_FORMAT ";", CMAF_preamb);
+  g_print(" CMAF_styp % " G_GUINT32_FORMAT ";",CMAF_styp);
+  g_print(" CMAF_ISMF % " G_GUINT32_FORMAT ";", CMAF_ISMF);
+  g_print(" CMAF_NTP_FRAC % " G_GUINT32_FORMAT ";",CMAF_preamb_1);
+  g_print(" CMAF_preamb_1 % " G_GUINT32_FORMAT ";", CMAF_preamb_2);
+  g_print(" CMAF_imsf % " G_GUINT32_FORMAT ";",CMAF_imsf);
+  g_print(" CMAF_sidx % " G_GUINT32_FORMAT ";", CMAF_sidx);
+  g_print(" CMAF_unknow_1 % " G_GUINT32_FORMAT ";",CMAF_unknow_1);
+  g_print(" CMAF_prft % " G_GUINT32_FORMAT ";", CMAF_prft);
+  g_print(" CMAF_unknow_2 % " G_GUINT32_FORMAT ";",CMAF_unknow_2);
+  g_print(" CMAF_unknow_3 % " G_GUINT32_FORMAT ";",CMAF_unknow_3);
+  */
+  
+  GST_LOG_OBJECT (stream->pad, "CMAF_NTP_SEC % " G_GUINT32_FORMAT ";", CMAF_NTP_SEC);
+  GST_LOG_OBJECT (stream->pad, "CMAF_NTP_FRAC % " G_GUINT32_FORMAT ";",CMAF_NTP_FRAC);
+  
+  dashdemux->NTP_SEC = CMAF_NTP_SEC;
+  dashdemux->NTP_FRAC = CMAF_NTP_FRAC;
+
+  
+  gst_byte_reader_set_pos (&reader, 0);
+  
+  
+  GST_LOG_OBJECT (stream->pad, "Current fragment ts % " GST_TIME_FORMAT
+        "; Fragment duration: % " GST_TIME_FORMAT "\n",
+        GST_TIME_ARGS (dash_stream->current_fragment_timestamp),
+        GST_TIME_ARGS (stream->fragment.duration));
+        
   /* While there are more boxes left to parse ... */
   dash_stream->isobmff_parser.current_start_offset = buffer_offset;
   do {
@@ -3265,11 +3365,14 @@ static GstFlowReturn
 gst_dash_demux_handle_isobmff (GstAdaptiveDemux * demux,
     GstAdaptiveDemuxStream * stream)
 {
+	
   GstDashDemuxStream *dash_stream = (GstDashDemuxStream *) stream;
   GstFlowReturn ret = GST_FLOW_OK;
   GstBuffer *buffer;
   gboolean sidx_advance = FALSE;
+  
 
+        
   /* We parse all ISOBMFF boxes of a (sub)fragment until the mdat. This covers
    * at least moov, moof and sidx boxes. Once mdat is received we just output
    * everything until the next (sub)fragment */
@@ -3438,7 +3541,7 @@ gst_dash_demux_data_received (GstAdaptiveDemux * demux,
   GstDashDemuxStream *dash_stream = (GstDashDemuxStream *) stream;
   GstFlowReturn ret = GST_FLOW_OK;
   guint index_header_or_data;
-
+  
   if (stream->downloading_index)
     index_header_or_data = 1;
   else if (stream->downloading_header)
