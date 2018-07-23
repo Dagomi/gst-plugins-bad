@@ -5,7 +5,7 @@
  *
  * Copyright (C) 2012 Orange
  * Authors:
- *   David Corvoysier <david.corvoysier@orange.com>
+ *   David Gomez <david.corvoysier@orange.com>
  *   Hamid Zakari <hamid.zakari@gmail.com>
  *
  * Copyright (C) 2013 Smart TV Alliance
@@ -129,6 +129,9 @@ struct _GstDashDemux
   GMutex client_lock;
 
   GstDashDemuxClockDrift *clock_drift;
+  
+  guint32 NTP_SEC;
+  guint32 NTP_FRAC;
 
   gboolean end_of_period;
   gboolean end_of_manifest;
